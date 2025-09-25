@@ -234,7 +234,7 @@ class Mlp(nn.Module):
 
 class ECB(nn.Module):
     """
-    Efficient Convolution Block
+    Efficient Convolution Block (优化版：动态3×3/5×5卷积核)
     """
     def __init__(self, in_channels, out_channels, stride=1, path_dropout=0,
                  drop=0, head_dim=32, mlp_ratio=3):
@@ -244,16 +244,72 @@ class ECB(nn.Module):
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
         assert out_channels % head_dim == 0
 
+        # 原有 PatchEmbed 和 MHCA 保持不变
         self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
         self.mhca = MHCA(out_channels, head_dim)
         self.attention_path_dropout = DropPath(path_dropout)
 
-        self.conv = LocalityFeedForward(out_channels, out_channels, 1, mlp_ratio, reduction=out_channels)
+        ###########################################
+        # 优化1：替换原单分支LocalityFeedForward，改为双卷积分支
+        ###########################################
+        # 分支1：3×3卷积（小核，精细捕捉小病灶边缘）
+        self.conv3x3 = LocalityFeedForward(
+            out_channels, out_channels, 1, mlp_ratio, reduction=out_channels,
+            kernel_size=3  # 新增参数：指定3×3核
+        )
+        # 分支2：5×5卷积（大核，覆盖大器官范围）
+        self.conv5x5 = LocalityFeedForward(
+            out_channels, out_channels, 1, mlp_ratio, reduction=out_channels,
+            kernel_size=5  # 新增参数：指定5×5核
+        )
 
+        ###########################################
+        # 优化2：新增动态权重注意力（基于特征自适应选择核）
+        ###########################################
+        self.dynamic_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # 全局平均池化：捕捉特征全局信息
+            nn.Conv2d(out_channels, 2, kernel_size=1, bias=False),  # 输出2个权重（对应3×3/5×5）
+            nn.Softmax(dim=1)  # 归一化权重，确保权重和为1
+        )
+
+        # 原有 norm 和 is_bn_merged 保持不变
         self.norm = norm_layer(out_channels)
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop, bias=True)
-        #self.mlp_path_dropout = DropPath(path_dropout)
         self.is_bn_merged = False
+
+    # 原有 merge_bn 方法保持不变（若用不到可忽略）
+    def merge_bn(self):
+        if not self.is_bn_merged:
+            # 若原代码中用到 mlp.merge_bn，此处需同步适配，当前代码中 mlp 已移除，故简化
+            self.is_bn_merged = True
+
+    ###########################################
+    # 优化3：修改 forward 逻辑，实现动态核融合
+    ###########################################
+    def forward(self, x):
+        # 原有 PatchEmbed + MHCA 流程不变
+        x = self.patch_embed(x)
+        x = x + self.attention_path_dropout(self.mhca(x))
+
+        # 原有 norm 逻辑不变
+        if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
+            out = self.norm(x)
+        else:
+            out = x
+
+        ###########################################
+        # 动态核逻辑：生成权重 + 融合双分支输出
+        ###########################################
+        # 1. 生成动态权重（shape: [B, 2, 1, 1]，B为批次大小）
+        weights = self.dynamic_attn(out)  # weights[:,0]→3×3权重，weights[:,1]→5×5权重
+        # 2. 双分支卷积计算
+        out3x3 = self.conv3x3(out)  # 3×3分支输出（小病灶适配）
+        out5x5 = self.conv5x5(out)  # 5×5分支输出（大器官适配）
+        # 3. 按权重融合输出（空间维度广播权重）
+        out = weights[:, 0:1] * out3x3 + weights[:, 1:2] * out5x5
+
+        # 原有残差连接逻辑不变
+        x = x + out  # (B, dim, H, W)，与原输出格式一致
+        return x
 
     def merge_bn(self):
         if not self.is_bn_merged:
